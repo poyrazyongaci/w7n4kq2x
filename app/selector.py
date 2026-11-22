@@ -1057,6 +1057,48 @@ def _rebinds(tree, name: str) -> bool:
     return False
 
 
+def _import_fails(text: str, rel: str) -> str:
+    """Why the rules below cannot be trusted with this source, or "". Python
+    compiles the file's bytes, the rules read its text. The compiler rejects
+    what ast.parse lets through (break outside a loop, return or yield outside
+    a function, nonlocal at module level, a duplicate argument name), and a
+    coding line or a BOM can make the bytes mean other code than the text."""
+    import warnings
+    if "\x00" in text:
+        return "null byte"  # a SyntaxError for the importer, no rule models it
+    parses = True
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        parses = False
+    except Exception as e:  # noqa: BLE001
+        return f"does not parse ({type(e).__name__})"
+    try:
+        src = text.encode("utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compile(src, rel, "exec", dont_inherit=True)
+    except SyntaxError:
+        if not parses:
+            # the module fails at import and the text shows it: analyze_py and
+            # the test file rule have a path for a syntax error
+            return ""
+        return "does not compile (SyntaxError)"
+    except Exception as e:  # noqa: BLE001
+        return f"does not compile ({type(e).__name__})"
+    if not parses:
+        # a BOM or a coding line: the module imports, as code the rules cannot read
+        return "imports as other code than its text"
+    if any(b"coding" in h for h in re.split(rb"\r\n|\r|\n", src, maxsplit=2)[:2]):
+        # a coding line may decode the bytes to other text than the rules see
+        try:
+            if ast.dump(ast.parse(src)) != ast.dump(ast.parse(text)):
+                return "coding line changes the decoded source"
+        except Exception as e:  # noqa: BLE001
+            return f"decoded source not comparable ({type(e).__name__})"
+    return ""
+
+
 def _top_classes(text: str) -> set:
     """Top-level classes of a module whose every class statement, nested ones
     too, names its bases as plain names or attributes rooted at a name the
@@ -2820,6 +2862,17 @@ class Analyzer:
             a.patched[old_rel] = None
         if new_rel is not None:
             a.patched[new_rel] = new_text
+        why = ""
+        if new_rel is not None and new_rel.endswith(".py"):
+            why = _import_fails(new_text, new_rel)
+        if why:
+            # the module fails at import, or loads as other text than the
+            # rules below read, and lazy imports hide some of its loaders
+            # from the static import graph: keep every test
+            a.full = True
+            a.rsafe = False
+            a.reasons.append(f"{why} {new_rel}")
+            return
 
         for r in {old_rel, new_rel} - {None}:
             base = os.path.basename(r)
