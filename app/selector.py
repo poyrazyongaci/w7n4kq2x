@@ -1403,6 +1403,7 @@ class Analysis:
         self.imp_strict = False
         self.equiv = ([], {})  # see site_equiv; None once any change is not of that kind
         self.equiv_files: set = set()
+        self.tpc_inert: list = []  # patched files outside sqlglot/ the TPC tests never read
         self.collect = False  # a new conftest only drops collected items: collect to see which
         # a package module changed outside function bodies: its import runs
         # the change, and a module that no longer imports fails every test
@@ -1461,10 +1462,83 @@ class Analyzer:
         self._reach_cache = None
         self._tree_cache = None
         self.warned = None  # tests that raise a warning on the pinned tree
+        self._inert_probe = None  # rel under a tpc_inert probe
+        # what a pytest session reads before any test runs, outside the map's
+        # test buckets (tools/startup_reads.sh); None: unknown, nothing is inert
+        self.startup = None
+        try:
+            st = json.load(open(os.path.join(APP, "startup_reads.json")))
+            self.startup = set(st["opened"]) | set(st["executor_modules"])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.warned = json.loads(gzip.decompress(open(os.path.join(APP, "warn.json.gz"), "rb").read()))
         except Exception:  # noqa: BLE001
             pass
+
+    def tpc_inert(self, fd) -> str | None:
+        """Why the replayed TPC tests provably never see this patched file
+        outside sqlglot/, or None. Proof is the map recorded on the pinned
+        tree: no TPC test (its collection, setup, call and pool workers,
+        traced in process) opened the file or ran a line of it, nothing it
+        imports reaches it, and the file's own rules select no TPC test."""
+        rel = fd.old
+        if fd.binary or rel is None or fd.new != rel or not fd.hunks:
+            return None
+        if rel.startswith(("sqlglot/", "sqlglotrs/", "sqlglotc/")) or rel in TPC_FIXTURES \
+                or rel.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")):
+            return None
+        base = os.path.basename(rel)
+        if base in CONFIG_FILES or base == "__init__.py" or rel in RISK_TEST_LIVE:
+            return None
+        if not os.path.isfile(os.path.join(SRC, rel)) or os.path.islink(os.path.join(SRC, rel)):
+            return None
+        # read at pytest startup or collection, where the map credits no test
+        if self.startup is None or rel in self.startup:
+            return None
+        mp = self.mp
+        why = None
+        tpc = 0
+        for tid in TPC_IDS:
+            n = mp.num_of_id.get(tid)
+            if n is None:
+                tpc = None
+                break
+            tpc |= 1 << n
+        # the map must know all three tests, and none may run a child process
+        # it could not trace
+        if tpc and not tpc & mp.unknown and not tpc & mp.spawn \
+                and not (mp.opened_tests(rel) | mp.file_tests(rel)) & tpc:
+            ok = True
+            if rel.endswith(".py"):
+                # anything that imports it, at any depth, must be as clean
+                seen, queue = {rel}, [rel]
+                while queue and ok:
+                    x = queue.pop()
+                    if x in RISK_TEST_LIVE or os.path.basename(x) in CONFIG_FILES \
+                            or os.path.basename(x) == "__init__.py" \
+                            or (mp.by_file.get(x, 0) | mp.opened_tests(x) | mp.file_tests(x)) & tpc:
+                        ok = False
+                    for imp in self.importers.get(x, []):
+                        if imp not in seen:
+                            seen.add(imp)
+                            queue.append(imp)
+            if ok:
+                # the file's own analysis, alone: it must stay exact, not
+                # select everything, and reach no TPC test
+                probe = Analysis("probe")
+                self._inert_probe = rel
+                try:
+                    self.analyze_file(probe, fd)
+                except Exception:  # noqa: BLE001
+                    probe.full = True
+                finally:
+                    self._inert_probe = None
+                if probe.applied and not probe.full and probe.rsafe and not probe.rq \
+                        and not probe.gone and not probe.collect and not probe.imp_check \
+                        and not (probe.cand | probe.imp) & tpc:
+                    why = f"{rel} unread by the TPC tests"
+        return why
 
     # rules -------------------------------------------------------------
     def module_rule(self, rel: str) -> int:
@@ -2821,7 +2895,15 @@ class Analyzer:
             a.tpcds_only = True
         elif fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
                 or not rel.endswith(".py"):
-            a.rsafe = False
+            # a file the TPC tests provably never read leaves the replay exact
+            if rel is not None and rel == self._inert_probe:
+                pass
+            else:
+                why = self.tpc_inert(fd)
+                if why is None:
+                    a.rsafe = False
+                else:
+                    a.tpc_inert.append(why)
         if old_rel and old_rel != new_rel and old_rel.startswith("sqlglot/"):
             a.gone = True  # a package file was deleted or renamed
         if fd.binary:
@@ -5231,6 +5313,9 @@ def main():
                 plan[c]["tp_path"] = "no proxy baseline or tpcds_only filter"
             else:
                 plan[c]["tp_path"] = "replay planned"
+            if a.tpc_inert and not a.full:
+                plan[c]["tp_path"] += f" [inert: {'; '.join(a.tpc_inert)}]"
+                log(f"{c}: {plan[c]['tp_path']}")
         if tp and an.rq is not None:
             fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched
             if not (a.fq_all or an.rq.front is None):
