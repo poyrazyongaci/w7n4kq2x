@@ -33,3 +33,5 @@ ENV SKIP_INTEGRATION=0 PYTHONUNBUFFERED=1
 # bytecode runs the same, with /app as sys.path[0] all the same.
 CMD ["python", "/app/main.pyc"]
 ENV BLAST_TPCDS_RISK=0
+# DIAG only, never a pick candidate: strict table rule back to loose
+ENV BLAST_KEYSTRICT=0
