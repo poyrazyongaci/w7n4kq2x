@@ -166,7 +166,7 @@ def _lines(text: str) -> list[str]:
 
 
 LINK_MODE_RE = re.compile(
-    r"(?:new file mode|deleted file mode|old mode|new mode) 1[26]0000\b|index \S+ 1[26]0000\b")
+r"(?:new file mode|deleted file mode|old mode|new mode) 0*1[26]0000\b|index \S+ 0*1[26]0000\b")
 
 
 def _import_time_effects(text: str):
@@ -205,6 +205,94 @@ def _import_time_effects(text: str):
             walk(ch)
 
     walk(tree)
+    # names pytest itself reads from a test module: a plugin list makes
+    # plain hook functions session-wide, with no call at import
+    special = ("pytest_plugins", "pytestmark", "collect_ignore", "collect_ignore_glob")
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            name = node.id
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.split(".")[0]
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        if name is not None and (name in special or name.startswith("pytest_")):
+            k = "name:" + name + ":" + ast.dump(node)
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
+_OK_IMPORT_ROOTS = frozenset(getattr(sys, "stdlib_module_names", ())) | {"sqlglot", "tests"}
+
+
+def _test_module_frame(text: str):
+    """Everything in a test module except what a test file may change freely:
+    bodies of test_* functions and methods, new undecorated test_* functions,
+    new plain Test* classes, docstrings, and plain imports of the standard
+    library, sqlglot or tests. pytest imports every test module before it
+    runs anything, so whatever else a test file changes at module or class
+    level (assignments, decorators, fixtures, hooks, setUp, helpers, plugin
+    lists) may reach the whole session. None when the text does not parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    out: dict = {}
+
+    def note(k):
+        out[k] = out.get(k, 0) + 1
+
+    def plain_import(st) -> bool:
+        if isinstance(st, ast.Import):
+            mods = [al.name for al in st.names]
+        elif isinstance(st, ast.ImportFrom):
+            if st.level:
+                return False
+            mods = [st.module or ""]
+        else:
+            return False
+        for al in st.names:
+            bound = al.asname or al.name.split(".")[0]
+            if al.name == "*" or bound.startswith(("pytest_", "__")) or bound in (
+                    "pytestmark", "collect_ignore", "collect_ignore_glob"):
+                return False
+        return all(m.split(".")[0] in _OK_IMPORT_ROOTS for m in mods)
+
+    def simple_bases(cl) -> bool:
+        if cl.decorator_list or cl.keywords:
+            return False
+        for b in cl.bases:
+            x = b
+            while isinstance(x, ast.Attribute):
+                x = x.value
+            if not isinstance(x, ast.Name):
+                return False
+        return True
+
+    def body(stmts, where, in_test_class):
+        for i, st in enumerate(stmts):
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and i == 0:
+                continue  # docstring
+            if isinstance(st, ast.Pass):
+                continue
+            if plain_import(st) and not in_test_class:
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name.startswith("test_"):
+                a = st.args
+                if st.decorator_list or a.defaults or any(x is not None for x in a.kw_defaults):
+                    hdr = ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
+                        ast.dump(d) for d in st.decorator_list) + ast.dump(a)
+                    note(f"{where}/def {st.name}:{hdr}")
+                continue
+            if isinstance(st, ast.ClassDef) and st.name.startswith("Test") and not in_test_class \
+                    and simple_bases(st):
+                body(st.body, f"{where}/{st.name}", True)
+                continue
+            note(f"{where}:{ast.dump(st)}")
+
+    body(tree.body, "", False)
     return out
 
 
@@ -2678,6 +2766,12 @@ class Analyzer:
             if was is None or now is None or any(n > was.get(k, 0) for k, n in now.items()):
                 a.full = True
                 a.reasons.append(f"import-time code in {new_rel}")
+                return
+            was = _test_module_frame(old_text) if old_rel is not None else {}
+            now = _test_module_frame(new_text)
+            if was is None or now is None or was != now:
+                a.full = True
+                a.reasons.append(f"test module frame changed in {new_rel}")
                 return
         if new_rel is not None and new_rel.startswith("sqlglot/") and not new_rel.endswith(".py") \
                 and old_rel != new_rel:
