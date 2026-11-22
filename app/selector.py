@@ -1141,6 +1141,9 @@ class Analysis:
         # impfp keys a nested class change may alter (see nested_rule); only
         # honoured while every import-time doubt comes from that rule
         self.imp_excuse: list = []
+        # the exact keys of deleted or re-headed methods (method_rule); they
+        # stay excused under imp_strict, see the job setup
+        self.imp_excuse_meth: list = []
         self.imp_strict = False
         self.equiv = ([], {})  # see site_equiv; None once any change is not of that kind
         self.equiv_files: set = set()
@@ -2853,6 +2856,7 @@ class Analyzer:
                     a.cand |= cand
                     a.imp |= imp & ~cand
                     a.imp_excuse += keys
+                    a.imp_excuse_meth += keys
                     a.broad |= self.class_rule(rel, scope)
                     a.reasons.append(f"method header or deletion, state check {rel}")
                     continue
@@ -5070,7 +5074,12 @@ def main():
             jobs.append(job)
             cjob[c] = job
         job["impfp"] = True
-        job["imp_excuse"] = [] if a.imp_strict else sorted(set(a.imp_excuse))
+        # Strict mode (a changed function the imports run) excuses no key
+        # that the changed code could have computed. The key of a deleted
+        # method is not one: it names the def itself, absent on one side by
+        # construction, and every run-time lookup of it is a candidate
+        # already (method_rule). Any other key must still match.
+        job["imp_excuse"] = sorted(set(a.imp_excuse_meth)) if a.imp_strict else sorted(set(a.imp_excuse))
         job["gain"] += gain
         job["est_wall"] += 3.0
         job["max_wall"] += 30.0
