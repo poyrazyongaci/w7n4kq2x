@@ -73,6 +73,12 @@ TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/op
 RISK_TEST_LIVE = {"tests/test_executor.py", "tests/helpers.py", "tests/__init__.py"}
 
 
+# top-level folders of the pinned tree that hold Python files. A .py file
+# under any other top-level folder is a new package on the test path.
+KNOWN_TOP = ("sqlglot", "tests", "sqlglotc", "benchmarks", "pdoc", "posts", "docs",
+             "sqlglot-integration-tests", ".github")
+
+
 def risk_inert(rel):
     """A patched text file the TPC-DS test never reads, so a sampled replay
     of it says as much as it does for a package-only commit."""
@@ -159,6 +165,49 @@ def _lines(text: str) -> list[str]:
     return out
 
 
+LINK_MODE_RE = re.compile(
+    r"(?:new file mode|deleted file mode|old mode|new mode) 1[26]0000\b|index \S+ 1[26]0000\b")
+
+
+def _import_time_effects(text: str):
+    """What a module does when it is imported, apart from defining names:
+    every call and every store into an attribute or an item that runs
+    outside a function body. Decorators, default values and class bodies
+    count, they run at import. None when the text does not parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    out: dict = {}
+
+    def note(node):
+        k = ast.dump(node)
+        out[k] = out.get(k, 0) + 1
+
+    def walk(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in node.decorator_list:
+                walk(d)
+            for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                walk(d)
+            return
+        if isinstance(node, ast.Lambda):
+            for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                walk(d)
+            return
+        if isinstance(node, ast.Call):
+            note(node)
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            note(node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            note(node)
+        for ch in ast.iter_child_nodes(node):
+            walk(ch)
+
+    walk(tree)
+    return out
+
+
 def parse_patch(text: str) -> list[FileDiff]:
     files: list[FileDiff] = []
     cur = None
@@ -183,6 +232,10 @@ def parse_patch(text: str) -> list[FileDiff]:
             cur.new = _strip_prefix(lines[i + 1][4:])
             i += 2
             continue
+        if cur is not None and LINK_MODE_RE.match(line):
+            # a symlink or a submodule entry: its text is a target, not a
+            # file body, and it can stand in for a module. Select every test
+            cur.binary = True
         if cur is not None and line.startswith(("new file mode", "deleted file mode")):
             if line.startswith("new"):
                 cur.old = None
@@ -191,6 +244,12 @@ def parse_patch(text: str) -> list[FileDiff]:
             i += 1
             continue
         if cur is not None and (line.startswith("Binary files") or line.startswith("GIT binary patch")):
+            cur.binary = True
+            i += 1
+            continue
+        if cur is not None and line.startswith(("copy from ", "copy to ")):
+            # a copied file is a new module nobody mapped: handled like a
+            # binary change, which selects every test
             cur.binary = True
             i += 1
             continue
@@ -1141,9 +1200,6 @@ class Analysis:
         # impfp keys a nested class change may alter (see nested_rule); only
         # honoured while every import-time doubt comes from that rule
         self.imp_excuse: list = []
-        # the exact keys of deleted or re-headed methods (method_rule); they
-        # stay excused under imp_strict, see the job setup
-        self.imp_excuse_meth: list = []
         self.imp_strict = False
         self.equiv = ([], {})  # see site_equiv; None once any change is not of that kind
         self.equiv_files: set = set()
@@ -2486,9 +2542,30 @@ class Analyzer:
             a.applied = False
             a.reasons.append(f"unparseable patch: {e}")
             return a
+        if "\r" in text:
+            # a carriage return in a patch: line splitting here and in the
+            # tool that applies it may differ, so nothing is concluded
+            a.full = True
+            a.applied = False
+            a.reasons.append("carriage return in patch")
+            return a
         if not diffs:
+            if text.strip():
+                # text the parser found no file in: not understood
+                a.full = True
+                a.applied = False
+                a.reasons.append("patch with no file diff")
+                return a
             a.reasons.append("empty patch")
             return a
+        for fd in diffs:
+            if not fd.hunks and not fd.binary and fd.old == fd.new:
+                # a block with no hunk the parser knows (combined diff, mode
+                # only, unknown header): not understood
+                a.full = True
+                a.applied = False
+                a.reasons.append(f"no hunks for {fd.new}")
+                return a
         # patch applies two blocks for one path in turn; here each block is
         # applied to the pinned text and only the last would be kept
         seen: set = set()
@@ -2529,6 +2606,18 @@ class Analyzer:
             a.applied = False
             a.reasons.append(f"binary {rel}")
             return
+        for r in (old_rel, new_rel):
+            # code every test process can load without any test naming it:
+            # a root-level module (sitecustomize and the like, the checkout
+            # is on the path), the optional sqlglotrs package, path files
+            # and installed-package metadata
+            if r and ((r.endswith(".py") and "/" not in r and r != "setup.py")
+                      or (r.endswith(".py") and "/" in r and r.split("/", 1)[0] not in KNOWN_TOP)
+                      or r.startswith("sqlglotrs/") or r.endswith(".pth")
+                      or ".dist-info/" in r or ".egg-info/" in r):
+                a.full = True
+                a.reasons.append(f"root-level code {r}")
+                return
         old_text = ""
         if old_rel is not None:
             p = os.path.join(SRC, old_rel)
@@ -2580,6 +2669,24 @@ class Analyzer:
                 a.reasons.append(f"config {r}")
                 return
 
+        if new_rel is not None and new_rel.startswith("tests/") and new_rel.endswith(".py"):
+            # pytest imports every test module before it runs anything, so
+            # code a test module runs at import reaches the whole session
+            # (logging.disable, a started mock, a recursion limit)
+            was = _import_time_effects(old_text) if old_rel is not None else {}
+            now = _import_time_effects(new_text)
+            if was is None or now is None or any(n > was.get(k, 0) for k, n in now.items()):
+                a.full = True
+                a.reasons.append(f"import-time code in {new_rel}")
+                return
+        if new_rel is not None and new_rel.startswith("sqlglot/") and not new_rel.endswith(".py") \
+                and old_rel != new_rel:
+            # a new non-Python file in the package can stand in for a module
+            # (extension suffix, a link) or be picked up by a directory scan
+            a.full = True
+            a.reasons.append(f"new package file {new_rel}")
+            return
+
         # directory listings see added or removed files
         if old_rel != new_rel:
             for r in {old_rel, new_rel} - {None}:
@@ -2611,10 +2718,6 @@ class Analyzer:
                 a.full = True
                 a.reasons.append(f"new module {new_rel}")
                 return
-            if new_rel.startswith("sqlglot/"):
-                a.sqlglot_modules.append(module_name(new_rel))
-                a.imp_check = True
-                a.imp_order = True
             a.broad |= mp.by_file.get(new_rel, 0)
             try:
                 new_tree = ast.parse(new_text)
@@ -2625,6 +2728,11 @@ class Analyzer:
                 leak_rule(a, new_rel, empty, new_tree, diff_ast(empty, new_tree))
             return
         if old_rel is not None and new_rel is not None and old_rel != new_rel:
+            if new_rel.startswith("sqlglot/") and new_rel.endswith(".py"):
+                # a module under a new name in the package: same as a new module
+                a.full = True
+                a.reasons.append(f"renamed into package {new_rel}")
+                return
             for r in (old_rel, new_rel):
                 if r.endswith(".py"):
                     a.cand |= self.module_rule(r) if r == old_rel else 0
@@ -2860,7 +2968,6 @@ class Analyzer:
                     a.cand |= cand
                     a.imp |= imp & ~cand
                     a.imp_excuse += keys
-                    a.imp_excuse_meth += keys
                     a.broad |= self.class_rule(rel, scope)
                     a.reasons.append(f"method header or deletion, state check {rel}")
                     continue
@@ -4770,7 +4877,11 @@ def main():
     analyses: dict = {}
     for c in commits:
         try:
-            text = open(os.path.join(commits_dir, c + ".patch"), encoding="utf-8", errors="surrogateescape").read()
+            if time.monotonic() - T0 > 0.5 * wall_limit:
+                raise TimeoutError("analysis out of time")
+            # newline="": a lone CR inside a line stays in that line, as git apply reads it
+            text = open(os.path.join(commits_dir, c + ".patch"), encoding="utf-8", errors="surrogateescape",
+                        newline="").read()
             a = an.analyze(c, text)
         except Exception as e:  # noqa: BLE001
             a = Analysis(c)
@@ -5078,12 +5189,7 @@ def main():
             jobs.append(job)
             cjob[c] = job
         job["impfp"] = True
-        # Strict mode (a changed function the imports run) excuses no key
-        # that the changed code could have computed. The key of a deleted
-        # method is not one: it names the def itself, absent on one side by
-        # construction, and every run-time lookup of it is a candidate
-        # already (method_rule). Any other key must still match.
-        job["imp_excuse"] = sorted(set(a.imp_excuse_meth)) if a.imp_strict else sorted(set(a.imp_excuse))
+        job["imp_excuse"] = [] if a.imp_strict else sorted(set(a.imp_excuse))
         job["gain"] += gain
         job["est_wall"] += 3.0
         job["max_wall"] += 30.0
@@ -5244,8 +5350,37 @@ def main():
             workers = fill_slack(workers, loads, extra + rest, dur)
         workers = [w for w in workers if w]
         print(json.dumps({"commit": c, "workers": workers}), flush=True)
+        PRINTED.add(c)
     log(f"done, simulated estimate {total / 1000:.1f}s")
 
 
+PRINTED: set = set()
+
+
+def fallback_all(err):
+    """Any error in main: every commit without a line yet gets every test."""
+    log(f"main failed ({type(err).__name__}: {err}), selecting every test for the rest")
+    tests = json.loads(open(os.path.join(DATA, "tests.json")).read())["tests"]
+    nums = sorted(t["number"] for t in tests)
+    dur = [0] * (max(nums) + 1 if nums else 0)
+    for t in tests:
+        dur[t["number"]] = round(t["seconds"] * 1000)
+    try:
+        workers = [w for w in best_pack(nums, dur)[0] if w]
+    except Exception:  # noqa: BLE001
+        workers = [nums]
+    cdir = os.path.join(DATA, "commits")
+    for c in sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch")):
+        if c not in PRINTED:
+            print(json.dumps({"commit": c, "workers": workers}), flush=True)
+            PRINTED.add(c)
+
+
 if __name__ == "__main__":
-    main()
+    MAIN_PID = os.getpid()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001
+        if os.getpid() != MAIN_PID or "--build-index" in sys.argv[1:]:
+            raise
+        fallback_all(e)
