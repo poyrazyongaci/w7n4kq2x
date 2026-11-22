@@ -169,6 +169,15 @@ LINK_MODE_RE = re.compile(
 r"(?:new file mode|deleted file mode|old mode|new mode) 0*1[26]0000\b|index \S+ 0*1[26]0000\b")
 
 
+def _def_annotations(node) -> list:
+    """Parameter and return annotations of a def, in source order."""
+    a = node.args
+    out = [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs]
+    out += [x.annotation for x in (a.vararg, a.kwarg) if x is not None]
+    out.append(node.returns)
+    return [x for x in out if x is not None]
+
+
 def _import_time_effects(text: str):
     """What a module does when it is imported, apart from defining names:
     every call and every store into an attribute or an item that runs
@@ -189,6 +198,9 @@ def _import_time_effects(text: str):
             for d in node.decorator_list:
                 walk(d)
             for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                walk(d)
+            # annotations run when the def statement runs
+            for d in _def_annotations(node) + list(getattr(node, "type_params", ())):
                 walk(d)
             return
         if isinstance(node, ast.Lambda):
@@ -281,9 +293,16 @@ def _test_module_frame(text: str):
                 continue
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name.startswith("test_"):
                 a = st.args
-                if st.decorator_list or a.defaults or any(x is not None for x in a.kw_defaults):
+                # only the body is free. Decorators, default values and
+                # annotations run at import, a literal annotation runs nothing
+                live = [x for x in _def_annotations(st) if not isinstance(x, ast.Constant)]
+                tps = list(getattr(st, "type_params", ()))
+                if st.decorator_list or a.defaults or any(x is not None for x in a.kw_defaults) or live or tps:
                     hdr = ast.dump(ast.Module(body=[], type_ignores=[])) + "|".join(
                         ast.dump(d) for d in st.decorator_list) + ast.dump(a)
+                    if live or tps:
+                        hdr += "->" + (ast.dump(st.returns) if st.returns is not None else "") + "|".join(
+                            ast.dump(d) for d in tps)
                     note(f"{where}/def {st.name}:{hdr}")
                 continue
             if isinstance(st, ast.ClassDef) and st.name.startswith("Test") and not in_test_class \
@@ -1158,6 +1177,9 @@ def _lambdas(node) -> list:
     return [n for n in ast.walk(node) if isinstance(n, ast.Lambda)]
 
 
+KEYGRAIN = os.environ.get("BLAST_KEYGRAIN", "1") == "1"
+
+
 class Site:
     """One changed spot. scope is a tuple of (kind, name, node) from the module down."""
 
@@ -1291,6 +1313,7 @@ class Analysis:
         self.imp_strict = False
         self.equiv = ([], {})  # see site_equiv; None once any change is not of that kind
         self.equiv_files: set = set()
+        self.tpc_inert: list = []  # patched files outside sqlglot/ the TPC tests never read
         self.collect = False  # a new conftest only drops collected items: collect to see which
         # a package module changed outside function bodies: its import runs
         # the change, and a module that no longer imports fails every test
@@ -1349,10 +1372,83 @@ class Analyzer:
         self._reach_cache = None
         self._tree_cache = None
         self.warned = None  # tests that raise a warning on the pinned tree
+        self._inert_probe = None  # rel under a tpc_inert probe
+        # what a pytest session reads before any test runs, outside the map's
+        # test buckets (tools/startup_reads.sh); None: unknown, nothing is inert
+        self.startup = None
+        try:
+            st = json.load(open(os.path.join(APP, "startup_reads.json")))
+            self.startup = set(st["opened"]) | set(st["executor_modules"])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.warned = json.loads(gzip.decompress(open(os.path.join(APP, "warn.json.gz"), "rb").read()))
         except Exception:  # noqa: BLE001
             pass
+
+    def tpc_inert(self, fd) -> str | None:
+        """Why the replayed TPC tests provably never see this patched file
+        outside sqlglot/, or None. Proof is the map recorded on the pinned
+        tree: no TPC test (its collection, setup, call and pool workers,
+        traced in process) opened the file or ran a line of it, nothing it
+        imports reaches it, and the file's own rules select no TPC test."""
+        rel = fd.old
+        if fd.binary or rel is None or fd.new != rel or not fd.hunks:
+            return None
+        if rel.startswith(("sqlglot/", "sqlglotrs/", "sqlglotc/")) or rel in TPC_FIXTURES \
+                or rel.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")):
+            return None
+        base = os.path.basename(rel)
+        if base in CONFIG_FILES or base == "__init__.py" or rel in RISK_TEST_LIVE:
+            return None
+        if not os.path.isfile(os.path.join(SRC, rel)) or os.path.islink(os.path.join(SRC, rel)):
+            return None
+        # read at pytest startup or collection, where the map credits no test
+        if self.startup is None or rel in self.startup:
+            return None
+        mp = self.mp
+        why = None
+        tpc = 0
+        for tid in TPC_IDS:
+            n = mp.num_of_id.get(tid)
+            if n is None:
+                tpc = None
+                break
+            tpc |= 1 << n
+        # the map must know all three tests, and none may run a child process
+        # it could not trace
+        if tpc and not tpc & mp.unknown and not tpc & mp.spawn \
+                and not (mp.opened_tests(rel) | mp.file_tests(rel)) & tpc:
+            ok = True
+            if rel.endswith(".py"):
+                # anything that imports it, at any depth, must be as clean
+                seen, queue = {rel}, [rel]
+                while queue and ok:
+                    x = queue.pop()
+                    if x in RISK_TEST_LIVE or os.path.basename(x) in CONFIG_FILES \
+                            or os.path.basename(x) == "__init__.py" \
+                            or (mp.by_file.get(x, 0) | mp.opened_tests(x) | mp.file_tests(x)) & tpc:
+                        ok = False
+                    for imp in self.importers.get(x, []):
+                        if imp not in seen:
+                            seen.add(imp)
+                            queue.append(imp)
+            if ok:
+                # the file's own analysis, alone: it must stay exact, not
+                # select everything, and reach no TPC test
+                probe = Analysis("probe")
+                self._inert_probe = rel
+                try:
+                    self.analyze_file(probe, fd)
+                except Exception:  # noqa: BLE001
+                    probe.full = True
+                finally:
+                    self._inert_probe = None
+                if probe.applied and not probe.full and probe.rsafe and not probe.rq \
+                        and not probe.gone and not probe.collect and not probe.imp_check \
+                        and not (probe.cand | probe.imp) & tpc:
+                    why = f"{rel} unread by the TPC tests"
+        return why
 
     # rules -------------------------------------------------------------
     def module_rule(self, rel: str) -> int:
@@ -2226,38 +2322,93 @@ class Analyzer:
         When the import itself never read the changed keys and never read the
         table whole, and the new entries evaluate at import as the pinned ones
         do, only those tests can see the change. None when that cannot be shown."""
+        r = self._table_rule(rel, site, old_tree)
+        if isinstance(r, str):
+            if os.environ.get("BLAST_KEYDBG"):
+                print(f"table_rule {rel}: {r}", file=sys.stderr)
+            return None
+        return r
+
+    def _table_rule(self, rel: str, site: Site, old_tree):
         tbl = getattr(self, "tbl", None)
-        if not tbl or site.scope or site.kind != "replace" or site.lam:
-            return None
+        if not tbl or site.kind != "replace" or site.lam:
+            return f"pre kind={site.kind} lam={site.lam}"
+        _KG["exp"] = _KG["dict"] = False
+        if KEYGRAIN:
+            stores = set()
+            exp_ok = False
+            for nd_ in list(ast.walk(old_tree)) + [x for n_ in (site.new or ()) for x in ast.walk(n_)]:
+                if isinstance(nd_, ast.Name) and not isinstance(nd_.ctx, ast.Load):
+                    stores.add(nd_.id)
+                elif isinstance(nd_, ast.arg):
+                    stores.add(nd_.arg)
+                elif isinstance(nd_, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    stores.add(nd_.name)
+                elif isinstance(nd_, (ast.Import, ast.ImportFrom)):
+                    for al in nd_.names:
+                        nm = al.asname or al.name.split(".")[0]
+                        if isinstance(nd_, ast.ImportFrom) and nd_.module == "sqlglot" and nd_.level == 0 \
+                                and al.name == "exp" and al.asname is None:
+                            exp_ok = True
+                        else:
+                            stores.add(nm)
+            _KG["dict"] = "dict" not in stores
+            _KG["exp"] = exp_ok and "exp" not in stores and not any(
+                (p_ or "").startswith("sqlglot/expressions") for p_ in getattr(self, "cur_paths", ("sqlglot/expressions",)))
         if not site.new or len(site.nodes) != 1 or len(site.new) != 1:
-            return None
+            return "r1"
         o, n = site.nodes[0], site.new[0]
         if type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
-            return None
+            return "r2"
         tg_o = o.targets if isinstance(o, ast.Assign) else [o.target]
         tg_n = n.targets if isinstance(n, ast.Assign) else [n.target]
         if len(tg_o) != 1 or len(tg_n) != 1 or _dump(tg_o[0]) != _dump(tg_n[0]) \
                 or not isinstance(tg_o[0], ast.Name):
-            return None
+            return "r3"
         if isinstance(o, ast.AnnAssign) and _dump(o.annotation) != _dump(n.annotation):
-            return None
+            return "r4"
         od, nd = o.value, n.value
-        if not isinstance(od, ast.Dict) or not isinstance(nd, ast.Dict) or not od.keys or not nd.keys:
-            return None
+        if KEYGRAIN and isinstance(od, ast.Set) and isinstance(nd, ast.Set):
+            if not od.elts or not nd.elts:
+                return "r5"
+        elif not isinstance(od, ast.Dict) or not isinstance(nd, ast.Dict) or not od.keys or not nd.keys:
+            return "r5"
+        if isinstance(tbl, str):
+            try:
+                tbl = self.tbl = json.loads(gzip.decompress(open(tbl, "rb").read()))
+            except Exception:  # noqa: BLE001
+                self.tbl = None
+                return "r0"
         info = tbl["sites"].get(f"{rel}:{od.lineno}:{od.col_offset}")
         if info is None or info["imp_all"]:
-            return None
+            return "r6"
         recorded = {(lo, hi): set(names) for lo, hi, names in info["entries"]}
         atoms, hashable = _module_atoms(old_tree)
 
+        spans: dict = {}
+
+        def ents(d):
+            # (key or None for an unpacked entry, value); a set element is its own key
+            out = []
+            if isinstance(d, ast.Set):
+                for e in d.elts:
+                    kv = (None, e.value) if isinstance(e, ast.Starred) else (e, e)
+                    spans[id(kv[1])] = (e.lineno, e.end_lineno)
+                    out.append(kv)
+            else:
+                for k, v in zip(d.keys, d.values):
+                    spans[id(v)] = ((k.lineno if k is not None else v.lineno), v.end_lineno)
+                    out.append((k, v))
+            return out
+
         def espan(k, v):
-            return (k.lineno if k is not None else v.lineno), v.end_lineno
+            return spans[id(v)]
 
         def edump(k, v):
             return ("**" if k is None else _dump(k)) + "=" + _dump(v)
 
-        oe = list(zip(od.keys, od.values))
-        ne = list(zip(nd.keys, nd.values))
+        oe = ents(od)
+        ne = ents(nd)
         sm = difflib.SequenceMatcher(None, [edump(*e) for e in oe], [edump(*e) for e in ne], autojunk=False)
         affected: set = set()
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -2266,9 +2417,9 @@ class Analyzer:
             olds, news = oe[i1:i2], ne[j1:j2]
             for k, v in news:
                 if not _import_safe(v, atoms, set()):
-                    return None
+                    return "r7"
                 if k is not None and not _import_safe(k, atoms, set()):
-                    return None
+                    return "r8"
             if tag == "replace" and len(olds) == 1 and len(news) == 1 \
                     and olds[0][0] is None and news[0][0] is None:
                 # **{k: v for k in {...}}: when only the key set changed,
@@ -2276,24 +2427,27 @@ class Analyzer:
                 d = _comp_key_delta(olds[0][1], news[0][1], hashable)
                 rec = recorded.get(espan(*olds[0]))
                 if rec is None:
-                    return None
+                    return "r9"
                 if d is not None and d[1] <= rec:
                     affected |= d[0] | d[1]
                     continue
             for k, v in olds:
                 rec = recorded.get(espan(k, v))
                 if rec is None:
-                    return None
+                    return "r10"
                 affected |= rec
             for k, v in news:
                 names = _entry_key_names(k, v, hashable)
                 if names is None:
-                    return None
+                    return "r11"
                 affected |= names
         if not affected or affected & set(info["imp_keys"]):
-            return None
+            return "r12"
         sets = tbl["sets"]
         out = self.mp.decode(sets[info["all"]]) | self.mp.decode(sets[tbl["unk"]])
+        if os.environ.get("BLAST_KEYDBG"):
+            print(f"KEYS {rel}: affected {sorted(affected)} all {len(bits_list(self.mp.decode(sets[info['all']])))} unk {len(bits_list(self.mp.decode(sets[tbl['unk']])))} "
+                  + str({n_: (len(bits_list(self.mp.decode(sets[info['keys'][n_]]))) if n_ in info['keys'] else None) for n_ in affected}), file=sys.stderr)
         for name in affected:
             sid = info["keys"].get(name)
             if sid is not None:
@@ -2646,6 +2800,7 @@ class Analyzer:
                 return a
             a.reasons.append("empty patch")
             return a
+        self.cur_paths = {p_ for fd in diffs for p_ in (fd.old, fd.new) if p_}
         for fd in diffs:
             if not fd.hunks and not fd.binary and fd.old == fd.new:
                 # a block with no hunk the parser knows (combined diff, mode
@@ -2686,7 +2841,15 @@ class Analyzer:
             a.tpcds_only = True
         elif fd.binary or old_rel != new_rel or not (rel or "").startswith("sqlglot/") \
                 or not rel.endswith(".py"):
-            a.rsafe = False
+            # a file the TPC tests provably never read leaves the replay exact
+            if rel is not None and rel == self._inert_probe:
+                pass
+            else:
+                why = self.tpc_inert(fd)
+                if why is None:
+                    a.rsafe = False
+                else:
+                    a.tpc_inert.append(why)
         if old_rel and old_rel != new_rel and old_rel.startswith("sqlglot/"):
             a.gone = True  # a package file was deleted or renamed
         if fd.binary:
@@ -3002,7 +3165,18 @@ class Analyzer:
                     a.fq_all = True
                 else:
                     a.fq |= fb
-                if cr is None or cr[1]:
+                ktb = None
+                if KEYGRAIN and cr is None and is_pkg and scope and all(sc[0] == "class" for sc in scope):
+                    ktb = self.table_rule(rel, site, old_tree)
+                if ktb is not None:
+                    a.cand |= ktb | mp.spawn
+                    self.no_run_reach(a, rel)
+                    a.reasons.append(f"class table entries {rel}, {len(bits_list(ktb))} read them")
+                    if os.environ.get("BLAST_KEYDBG"):
+                        print(f"KEYGRAIN {rel}: {len(bits_list(ktb))} tbl, spawn {len(bits_list(mp.spawn))}, cand now {len(bits_list(a.cand))}", file=sys.stderr)
+                    a.broad |= self.class_rule(rel, scope) | mp.file_tests(rel)
+                    continue
+                elif cr is None or cr[1]:
                     vb = self.r_static(rel, site, cr) if is_pkg else None
                     if vb is None and is_pkg and self.worker_unloaded(rel):
                         vb = 0  # fq_all is set above: every front end is replayed
@@ -4021,6 +4195,76 @@ def _module_atoms(tree) -> tuple[set, set]:
     return atoms, hashable
 
 
+_KG = {"exp": False, "dict": False}
+_EXP_FUNCS: list = []
+
+
+def _exp_funcs() -> set:
+    """Names of the pinned expression classes that descend from Func (so
+    `exp.X.from_arg_list` exists) and that pinned package code spells as
+    `exp.X` somewhere."""
+    if _EXP_FUNCS:
+        return _EXP_FUNCS[0]
+    bases: dict = {}
+    spelled: set = set()
+    root = os.path.join(SRC, "sqlglot")
+    try:
+        for dp, _dn, fns in os.walk(root):
+            for fn in fns:
+                if not fn.endswith(".py"):
+                    continue
+                text = open(os.path.join(dp, fn), encoding="utf-8").read()
+                spelled.update(re.findall(r"\bexp\.([A-Za-z_][A-Za-z0-9_]*)", text))
+                if os.path.relpath(dp, root).split(os.sep)[0] != "expressions":
+                    continue
+                for node in ast.parse(text).body:
+                    if isinstance(node, ast.ClassDef):
+                        bs = set()
+                        for b in node.bases:
+                            if isinstance(b, ast.Name):
+                                bs.add(b.id)
+                            elif isinstance(b, ast.Attribute):
+                                bs.add(b.attr)
+                        if node.name in bases:
+                            bases[node.name] = None  # two classes, one name: unknown
+                        else:
+                            bases[node.name] = bs
+    except Exception:  # noqa: BLE001
+        _EXP_FUNCS.append(set())
+        return _EXP_FUNCS[0]
+    out = set()
+
+    def is_func(n, seen):
+        if n == "Func":
+            return bases.get(n) is not None
+        bs = bases.get(n)
+        if not bs or n in seen:
+            return False
+        return any(is_func(b, seen | {n}) for b in bs)
+
+    for n in bases:
+        if n in spelled and n != "Func" and is_func(n, frozenset()):
+            out.add(n)
+    _EXP_FUNCS.append(out)
+    return out
+
+
+def _fromkeys(e):
+    """(key constants, value) of `dict.fromkeys((<str>, ...), value)`."""
+    if not isinstance(e, ast.Call) or e.keywords or len(e.args) != 2:
+        return None
+    f = e.func
+    if not (isinstance(f, ast.Attribute) and f.attr == "fromkeys"
+            and isinstance(f.value, ast.Name) and f.value.id == "dict"):
+        return None
+    ks = e.args[0]
+    if not isinstance(ks, (ast.Tuple, ast.List)) or not ks.elts:
+        return None
+    if not all(isinstance(x, ast.Constant) and isinstance(x.value, str) for x in ks.elts):
+        return None
+    return [x.value for x in ks.elts], e.args[1]
+
+
 def _import_safe(e, atoms: set, bound: set) -> bool:
     """Whether evaluating e at import cannot fail where the pinned module did
     not: built only from literals, displays, comprehensions, lambdas (bodies
@@ -4031,6 +4275,14 @@ def _import_safe(e, atoms: set, bound: set) -> bool:
         return True
     if _dump(e) in atoms and not (bound & {x.id for x in ast.walk(e) if isinstance(x, ast.Name)}):
         return True
+    if _KG["exp"] and "exp" not in bound and isinstance(e, ast.Attribute) and e.attr == "from_arg_list" \
+            and isinstance(e.value, ast.Attribute) and isinstance(e.value.value, ast.Name) \
+            and e.value.value.id == "exp" and e.value.attr in _exp_funcs():
+        return True
+    if _KG["dict"] and "dict" not in bound:
+        fk = _fromkeys(e)
+        if fk is not None:
+            return _import_safe(fk[1], atoms, bound)
     if isinstance(e, ast.Dict):
         return all(_import_safe(v, atoms, bound) for v in e.values) and \
             all(k is None or _import_safe(k, atoms, bound) for k in e.keys)
@@ -4090,6 +4342,9 @@ def _entry_key_names(k, v, hashable: set) -> set | None:
     if k is not None:
         n = _key_name(k, hashable)
         return None if n is None else {n}
+    fk = _fromkeys(v) if _KG["dict"] else None
+    if fk is not None:
+        return {"s:" + x for x in fk[0]}
     ck = _comp_keys(v)
     if ck is None:
         return None
@@ -4938,7 +5193,10 @@ def main():
                 log(f"per-query TPC evidence unavailable ({e})")
         an = Analyzer(mp, index, rlines, rq)
         try:
-            an.tbl = json.loads(gzip.decompress(open(os.path.join(APP, "tbl.json.gz"), "rb").read()))
+            # read on first use in _table_rule
+            an.tbl = os.path.join(APP, "tbl.json.gz")
+            if not os.path.exists(an.tbl):
+                raise FileNotFoundError(an.tbl)
         except Exception as e:  # noqa: BLE001
             log(f"table reads unavailable ({e})")
     except Exception as e:  # noqa: BLE001
@@ -5067,6 +5325,9 @@ def main():
                 plan[c]["tp_path"] = "no proxy baseline or tpcds_only filter"
             else:
                 plan[c]["tp_path"] = "replay planned"
+            if a.tpc_inert and not a.full:
+                plan[c]["tp_path"] += f" [inert: {'; '.join(a.tpc_inert)}]"
+                log(f"{c}: {plan[c]['tp_path']}")
         if tp and an.rq is not None:
             fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" in a.patched
             if not (a.fq_all or an.rq.front is None):
