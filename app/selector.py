@@ -2335,9 +2335,9 @@ class Analyzer:
                 if tag == "replace" and len(olds) == 1 and olds[0][0] is None and news[0][0] is None:
                     d = _comp_key_delta(olds[0][1], news[0][1], hashable)
                     rec = recorded.get(espan(*olds[0]))
-                    if rec is None or d is None or d[0] or not d[1] <= rec:
+                    if rec is None or d is None or d[0]:
                         return None
-                    affected |= d[1]
+                    affected |= rec  # every key of the entry, the delta's names are not trusted
                     continue
                 if tag == "replace":
                     for (ko, _vo), (kn, vn) in zip(olds, news):
