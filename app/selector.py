@@ -2605,8 +2605,12 @@ class Analyzer:
                 a.full = True
                 a.reasons.append(f"new file {new_rel} shadows a module")
                 return
-            # a new module only matters once something imports it, and that
-            # importer is itself a change; listings were handled above.
+            if new_rel.startswith("sqlglot/"):
+                # tests that walk the package or its registries see a new
+                # module without any importer changing, so no map covers it
+                a.full = True
+                a.reasons.append(f"new module {new_rel}")
+                return
             if new_rel.startswith("sqlglot/"):
                 a.sqlglot_modules.append(module_name(new_rel))
                 a.imp_check = True
